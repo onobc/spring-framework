@@ -19,11 +19,15 @@ package org.springframework.core.retry;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
+import org.assertj.core.api.InstanceOfAssertFactories;
 import org.assertj.core.api.ThrowingConsumer;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -31,8 +35,11 @@ import org.junit.jupiter.params.provider.Arguments.ArgumentSet;
 import org.junit.jupiter.params.provider.FieldSource;
 import org.mockito.InOrder;
 
+import org.springframework.util.backoff.FixedBackOff;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.params.provider.Arguments.argumentSet;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -236,6 +243,99 @@ class RetryTemplateTests {
 		inOrder.verify(retryListener).onRetryPolicyExhaustion(
 				eq(retryPolicy), eq(retryable), any(IllegalStateException.class));
 		inOrder.verifyNoMoreInteractions();
+	}
+
+	@Test
+	void shouldBeAbleToGetInitialExceptionWhenRetrySucceeds() throws RetryException {
+		var retryCount = new AtomicInteger(0);
+		var thrown = new ArrayList<Throwable>();
+		var retryListener = new RetryListener() {
+			@Override
+			public void onRetrySuccess(RetryPolicy retryPolicy, Retryable<?> retryable, @Nullable Object result) {
+				retryCount.incrementAndGet();
+			}
+			@Override
+			public void onRetryFailure(RetryPolicy retryPolicy, Retryable<?> retryable, Throwable throwable) {
+				retryCount.incrementAndGet();
+				thrown.add(throwable);
+			}
+			@Override
+			public void beforeRetry(RetryPolicy retryPolicy, Retryable<?> retryable) {
+				// If we could get ahold of the initial exception in this callback that would work
+				// OR
+				// if there was a set of `onInitial**` callbacks (pollute the API though)
+			}
+			@Override
+			public void onRetryPolicyExhaustion(RetryPolicy retryPolicy, Retryable<?> retryable, Throwable throwable) {
+				throw new RuntimeException("*** Should never made it here");
+			}
+		};
+		var retryTemplate = new RetryTemplate(
+				RetryPolicy.builder().backOff(new FixedBackOff(Duration.ofSeconds(2).toMillis(), 2)).build());
+		retryTemplate.setRetryListener(retryListener);
+		AtomicBoolean initialInvocation = new AtomicBoolean(true);
+		var initialException = new RuntimeException("initial invocation go boom!!!");
+		try {
+			retryTemplate.execute(() -> {
+				if (initialInvocation.getAndSet(false)) {
+					throw initialException;
+				}
+				return "All good on 1st retry attempt";
+			});
+		}
+		catch (RetryException ex) {
+			throw new RuntimeException("*** Should never made it here", ex);
+		}
+		assertThat(retryCount).hasValue(1);
+		// We want this to pass (or some variant of it w/ the suppressed exception)
+		assertThat(thrown).containsExactly(initialException);
+	}
+
+	@Test
+	void shouldBeAbleToGetInitialExceptionWhenRetryExhausts() {
+		var retryCount = new AtomicInteger(0);
+		var thrown = new ArrayList<Throwable>();
+		var retryListener = new RetryListener() {
+			@Override
+			public void onRetrySuccess(RetryPolicy retryPolicy, Retryable<?> retryable, @Nullable Object result) {
+				retryCount.incrementAndGet();
+			}
+			@Override
+			public void onRetryFailure(RetryPolicy retryPolicy, Retryable<?> retryable, Throwable throwable) {
+				retryCount.incrementAndGet();
+				thrown.add(throwable);
+			}
+			@Override
+			public void onRetryPolicyExhaustion(RetryPolicy retryPolicy, Retryable<?> retryable, Throwable throwable) {
+				thrown.add(throwable);
+			}
+		};
+		var retryTemplate = new RetryTemplate(
+				RetryPolicy.builder().backOff(new FixedBackOff(Duration.ofSeconds(2).toMillis(), 1)).build());
+		retryTemplate.setRetryListener(retryListener);
+		AtomicBoolean initialInvocation = new AtomicBoolean(true);
+		var initialException = new RuntimeException("initial invocation go boom!!!");
+		var secondaryException = new RuntimeException("retry1 invocation go boom!!!");
+		assertThatThrownBy(() ->
+				retryTemplate.execute(() -> {
+					if (initialInvocation.getAndSet(false)) {
+						throw initialException;
+					}
+					throw secondaryException;
+				})).isInstanceOf(RetryException.class);
+		assertThat(retryCount).hasValue(1);
+
+		// We have recorded 2 exceptions in our test list (the secondary and the final
+		// exhaustion)
+		assertThat(thrown).hasSize(2);
+		assertThat(thrown).element(0).isSameAs(secondaryException);
+		assertThat(thrown).element(1).satisfies((ex) -> {
+			assertThat(ex).isInstanceOf(RetryException.class);
+			assertThat(ex).extracting(Throwable::getSuppressed)
+					.asInstanceOf(InstanceOfAssertFactories.ARRAY)
+					.containsExactly(initialException);
+			assertThat(ex).extracting(Throwable::getCause).isEqualTo(secondaryException);
+		});
 	}
 
 	static final List<ArgumentSet> includesAndExcludesRetryPolicies = List.of(
